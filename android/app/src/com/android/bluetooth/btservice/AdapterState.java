@@ -24,6 +24,7 @@ import android.os.SystemProperties;
 import android.util.Log;
 
 import com.android.bluetooth.Util;
+import com.android.bluetooth.flags.Flags;
 import com.android.internal.util.StateMachine;
 
 // This state machine handles Bluetooth Adapter states.
@@ -67,6 +68,19 @@ final class AdapterState extends StateMachine {
     static final int BREDR_STOP_TIMEOUT = 10;
     static final int BLE_STOP_TIMEOUT = 11;
     static final int BLE_START_TIMEOUT = 12;
+    static final int USER_TURN_OFF_WITH_POLICY = 13;
+
+    // One transition only, owned by this state-machine thread. Unsupported
+    // flag combinations retain the upstream physical OFF path.
+    private boolean mKeepBleOnForUserOff;
+    private final boolean mKeepStackAliveOnUserOff = SystemProperties.getBoolean(
+            "bluetooth.framework.keep_stack_alive_on_user_off", false);
+
+    private boolean allowsLogicalUserOff() {
+        return mKeepStackAliveOnUserOff
+                && Flags.onlyStartScanDuringBleOn()
+                && !Flags.systemServerMigrateBmsToKotlin();
+    }
 
     private static final boolean DEGRADED_PERFORMANCE =
             SystemProperties.getBoolean(
@@ -152,6 +166,7 @@ final class AdapterState extends StateMachine {
             case BREDR_STARTED -> "BREDR_STARTED";
             case BLE_STARTED -> "BLE_STARTED";
             case USER_TURN_OFF -> "USER_TURN_OFF";
+            case USER_TURN_OFF_WITH_POLICY -> "USER_TURN_OFF_WITH_POLICY";
             case BLE_TURN_OFF -> "BLE_TURN_OFF";
             case BLE_STOPPED -> "BLE_STOPPED";
             case BREDR_STOPPED -> "BREDR_STOPPED";
@@ -231,6 +246,7 @@ final class AdapterState extends StateMachine {
 
         @Override
         public void enter() {
+            mKeepBleOnForUserOff = false;
             super.enter();
             if (mPrevState == State.BLE_TURNING_OFF) {
                 mAdapterService.cleanup();
@@ -260,6 +276,11 @@ final class AdapterState extends StateMachine {
             switch (msg.what) {
                 case USER_TURN_ON -> transitionTo(mTurningOn);
                 case BLE_TURN_OFF -> transitionTo(mTurningBleOff);
+                case USER_TURN_OFF_WITH_POLICY -> {
+                    // Revoke can race the queued BLE_ON callback. True cannot
+                    // establish a new hold from a BLE-only lifetime.
+                    if (msg.arg1 == 0) transitionTo(mTurningBleOff);
+                }
                 default -> {
                     infoLog("Unhandled message - " + messageString(msg.what));
                     return false;
@@ -277,7 +298,11 @@ final class AdapterState extends StateMachine {
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
-                case USER_TURN_OFF -> transitionTo(mTurningOff);
+                case USER_TURN_OFF, USER_TURN_OFF_WITH_POLICY -> {
+                    mKeepBleOnForUserOff = msg.what == USER_TURN_OFF_WITH_POLICY
+                            && msg.arg1 == 1 && allowsLogicalUserOff();
+                    transitionTo(mTurningOff);
+                }
                 default -> {
                     infoLog("Unhandled message - " + messageString(msg.what));
                     return false;
@@ -375,6 +400,7 @@ final class AdapterState extends StateMachine {
 
         @Override
         public void exit() {
+            mKeepBleOnForUserOff = false;
             removeMessages(BREDR_STOP_TIMEOUT);
             if (mAdapterService != null) {
                 Log.i(TAG, "Disconnecting all ACLs with BREDR Stopped");
@@ -387,7 +413,15 @@ final class AdapterState extends StateMachine {
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
-                case BREDR_STOPPED -> transitionTo(mTurningBleOff);
+                case BREDR_STOPPED -> transitionTo(
+                        mKeepBleOnForUserOff ? mBleOn : mTurningBleOff);
+
+                case USER_TURN_OFF, USER_TURN_OFF_WITH_POLICY -> {
+                    // Revocation wins; a late true cannot re-arm this stop.
+                    if (msg.what == USER_TURN_OFF || msg.arg1 == 0) {
+                        mKeepBleOnForUserOff = false;
+                    }
+                }
 
                 case BREDR_STOP_TIMEOUT -> {
                     errorLog(messageString(msg.what));

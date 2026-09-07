@@ -42,6 +42,11 @@ class AdapterBinder(rawBinder: IBinder) {
     }
 
     @Throws(RemoteException::class)
+    fun onToBleOnWithPolicy(keepBleOn: Boolean) {
+        adapterBinder.onToBleOnWithPolicy(keepBleOn)
+    }
+
+    @Throws(RemoteException::class)
     fun offToBleOn(quietMode: Boolean, hciInstanceName: String) {
         adapterBinder.offToBleOn(quietMode, hciInstanceName)
     }

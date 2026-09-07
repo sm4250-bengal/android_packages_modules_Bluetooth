@@ -1024,6 +1024,11 @@ public class AdapterService extends Service {
         mAdapterState.sendMessage(AdapterState.USER_TURN_OFF);
     }
 
+    void onToBleOnWithPolicy(boolean keepBleOn) {
+        // Message ordering, including revocation, belongs to AdapterState.
+        mAdapterState.sendMessage(AdapterState.USER_TURN_OFF_WITH_POLICY, keepBleOn ? 1 : 0);
+    }
+
     @VisibleForTesting
     void init(String hciInstanceName) {
         Log.d(TAG, "init(instance=" + hciInstanceName + ")");

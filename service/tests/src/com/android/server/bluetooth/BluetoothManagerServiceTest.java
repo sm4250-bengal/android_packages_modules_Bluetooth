@@ -50,6 +50,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 import android.app.ActivityManager;
@@ -67,6 +68,7 @@ import android.content.ServiceConnection;
 import android.os.IBinder;
 import android.os.IpcDataCache;
 import android.os.Message;
+import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.test.TestLooper;
@@ -91,6 +93,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.junit.rules.TestName;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -107,10 +110,11 @@ import java.util.stream.IntStream;
 @RunWith(ParameterizedAndroidJunit4.class)
 public class BluetoothManagerServiceTest {
     @Rule public final SetFlagsRule mSetFlagsRule;
+    @Rule public final TestName mTestName = new TestName();
 
     @Rule
     public final StaticMockitoRule mMockitoRule =
-            new StaticMockitoRule(BluetoothProperties.class, ActivityManager.class);
+            new StaticMockitoRule(BluetoothProperties.class, ActivityManager.class, SystemProperties.class);
 
     @Parameters(name = "{0}")
     public static List<FlagsWrapper> getParams() {
@@ -171,6 +175,11 @@ public class BluetoothManagerServiceTest {
 
     @Before
     public void setUp() throws Exception {
+        // Instance-lifetime read: no system-property write and no cached static
+        // policy leaking between tests. Existing tests remain the off control.
+        ExtendedMockito.doReturn(mTestName.getMethodName().startsWith("bengalLogical"))
+                .when(() -> SystemProperties.getBoolean(
+                        "bluetooth.framework.keep_stack_alive_on_user_off", false));
         mInOrder = inOrder(mContext, mManagerCallback, mAdapterBinder);
         ExtendedMockito.doNothing().when(() -> BluetoothProperties.factory_reset(true));
         mCurrentUser = DEFAULT_USER;
@@ -819,6 +828,72 @@ public class BluetoothManagerServiceTest {
         assertThat(mManagerService.getState()).isEqualTo(State.OFF);
 
         endTest();
+    }
+
+    private IBluetoothCallback bengalStartLogicalStop() throws Exception {
+        mManagerService.enable(0, "bengalLogical");
+        IBluetoothCallback callback = transition_offToOn();
+        mManagerService.disable("bengalLogical", true);
+        mInOrder.verify(mAdapterBinder).onToBleOnWithPolicy(true);
+        verifyBleStateIntentSent(State.ON, State.TURNING_OFF);
+        verifyStateIntentSent(State.ON, State.TURNING_OFF);
+        return callback;
+    }
+
+    @Test
+    @EnableFlags(Flags.FLAG_ONLY_START_SCAN_DURING_BLE_ON)
+    @DisableFlags(Flags.FLAG_SYSTEM_SERVER_MIGRATE_BMS_TO_KOTLIN)
+    public void bengalLogicalOff_keepsBleAndResumesWithoutColdOpen() throws Exception {
+        IBluetoothCallback callback = bengalStartLogicalStop();
+        callback.onBluetoothStateChange(State.TURNING_OFF, State.BLE_ON);
+        syncHandler(MESSAGE_BLUETOOTH_STATE_CHANGE);
+        assertThat(mManagerService.getState()).isEqualTo(State.BLE_ON);
+        verify(mAdapterBinder, never()).bleOnToOff();
+        mManagerService.enable(0, "bengalLogical");
+        assertThat(mManagerService.getState()).isEqualTo(State.TURNING_ON);
+        verify(mAdapterBinder, times(2)).bleOnToOn(); // cold startup + direct resume
+    }
+
+    @Test
+    @EnableFlags(Flags.FLAG_ONLY_START_SCAN_DURING_BLE_ON)
+    @DisableFlags(Flags.FLAG_SYSTEM_SERVER_MIGRATE_BMS_TO_KOTLIN)
+    public void bengalLogicalRapidEnable_waitsForBleCallback() throws Exception {
+        IBluetoothCallback callback = bengalStartLogicalStop();
+        mManagerService.enable(0, "bengalLogical");
+        verify(mAdapterBinder, times(1)).bleOnToOn();
+        callback.onBluetoothStateChange(State.TURNING_OFF, State.BLE_ON);
+        syncHandler(MESSAGE_BLUETOOTH_STATE_CHANGE);
+        verify(mAdapterBinder, times(2)).bleOnToOn();
+        verify(mAdapterBinder, never()).bleOnToOff();
+    }
+
+    @Test
+    @EnableFlags(Flags.FLAG_ONLY_START_SCAN_DURING_BLE_ON)
+    @DisableFlags(Flags.FLAG_SYSTEM_SERVER_MIGRATE_BMS_TO_KOTLIN)
+    public void bengalLogicalRapidEnableThenDisable_lastRequestWins() throws Exception {
+        IBluetoothCallback callback = bengalStartLogicalStop();
+        mManagerService.enable(0, "bengalLogical");
+        mManagerService.disable("bengalLogical", true);
+        callback.onBluetoothStateChange(State.TURNING_OFF, State.BLE_ON);
+        syncHandler(MESSAGE_BLUETOOTH_STATE_CHANGE);
+        assertThat(mManagerService.getState()).isEqualTo(State.BLE_ON);
+        verify(mAdapterBinder, times(1)).bleOnToOn();
+        verify(mAdapterBinder, never()).bleOnToOff();
+    }
+
+    @Test
+    @EnableFlags(Flags.FLAG_ONLY_START_SCAN_DURING_BLE_ON)
+    @DisableFlags(Flags.FLAG_SYSTEM_SERVER_MIGRATE_BMS_TO_KOTLIN)
+    public void bengalLogicalFactoryReset_revokesPendingStop() throws Exception {
+        IBluetoothCallback callback = bengalStartLogicalStop();
+        mManagerService.enable(0, "bengalLogical");
+        mManagerService.factoryReset(0);
+        verify(mAdapterBinder).onToBleOnWithPolicy(false);
+        callback.onBluetoothStateChange(State.TURNING_OFF, State.BLE_ON);
+        syncHandler(MESSAGE_BLUETOOTH_STATE_CHANGE);
+        verify(mAdapterBinder).bleOnToOff();
+        verify(mAdapterBinder, times(1)).bleOnToOn();
+        assertThat(mManagerService.getState()).isEqualTo(State.BLE_TURNING_OFF);
     }
 
     @Test

@@ -40,4 +40,8 @@ oneway interface IAdapter {
 
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_PRIVILEGED)")
     void setName(in String name);
+
+    // Device-policy request. False also revokes an in-flight logical OFF.
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_PRIVILEGED)")
+    void onToBleOnWithPolicy(boolean keepBleOn);
 }

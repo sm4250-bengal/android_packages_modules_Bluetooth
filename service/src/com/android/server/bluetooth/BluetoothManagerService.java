@@ -178,6 +178,56 @@ public class BluetoothManagerService {
     private boolean mQuietEnable = false;
     private boolean mEnable = false;
     private boolean mShutdownInProgress = false;
+    // Handler-thread-only. Keep the transition marker after revocation until
+    // its callback/OFF, so a queued BLE_ON cannot strand the controller.
+    private boolean mLogicalUserOff = false;
+    private boolean mLogicalOffTransition = false;
+    private boolean mLogicalResumeClassic = false;
+    private final boolean mKeepStackAliveOnUserOff = SystemProperties.getBoolean(
+            "bluetooth.framework.keep_stack_alive_on_user_off", false);
+
+    private boolean allowsLogicalUserOff() {
+        return mKeepStackAliveOnUserOff
+                && Flags.onlyStartScanDuringBleOn()
+                && !Flags.systemServerMigrateBmsToKotlin();
+    }
+
+    private void revokeLogicalUserOff(String cause) {
+        if (mLogicalUserOff || mLogicalOffTransition) {
+            Log.i(TAG, "Revoking logical user OFF: " + cause);
+        }
+        mLogicalUserOff = false;
+        mLogicalResumeClassic = false;
+        if (mLogicalOffTransition && mAdapter != null) {
+            try {
+                mAdapter.onToBleOnWithPolicy(false);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Unable to revoke logical user OFF", e);
+            }
+        }
+    }
+
+    private void setLogicalUserOffForDisable(int reason) {
+        if (reason != ENABLE_DISABLE_REASON_APPLICATION_REQUEST) {
+            revokeLogicalUserOff("non-user disable");
+            return;
+        }
+        mLogicalUserOff = allowsLogicalUserOff()
+                && (mState.oneOf(State.ON, State.TURNING_ON) || mLogicalUserOff);
+        mLogicalResumeClassic = false;
+    }
+
+    private void finishLogicalOffTransition() {
+        mLogicalOffTransition = false;
+        if (!mLogicalUserOff) {
+            // Forced revocation won, possibly after the app queued BLE_ON.
+            bleOnToOff();
+        } else if (mLogicalResumeClassic && mEnable && !mShutdownInProgress) {
+            mLogicalUserOff = false;
+            mLogicalResumeClassic = false;
+            bleOnToOn();
+        }
+    }
 
     private int mCrashes = 0;
     private Instant mLastBindingTime;
@@ -292,6 +342,7 @@ public class BluetoothManagerService {
     }
 
     boolean factoryReset(int count) {
+        revokeLogicalUserOff("factory reset");
         if (mAutoOn != null) {
             mAutoOn.factoryReset();
         }
@@ -403,6 +454,8 @@ public class BluetoothManagerService {
     }
 
     void onUserSwitching(UserHandle userHandle) {
+        if (mLogicalOffTransition) mEnable = false;
+        revokeLogicalUserOff("user switch request");
         if (Flags.systemServerDirectSwitch()) {
             Log.d(TAG, "onUserSwitching(" + userHandle + ") -- Direct switch");
             handleSwitchUser(userHandle);
@@ -415,6 +468,8 @@ public class BluetoothManagerService {
     }
 
     private void forceToOffFromModeChange(int currentState, int reason) {
+        if (mLogicalOffTransition) mEnable = false;
+        revokeLogicalUserOff("forced mode change");
         // Clear registered LE apps to force shut-off
         mBleAppManager.clearBleApps();
 
@@ -544,6 +599,7 @@ public class BluetoothManagerService {
                     } else if (action.equals(Intent.ACTION_SHUTDOWN)) {
                         Log.i(TAG, "Device is shutting down.");
                         mShutdownInProgress = true;
+                        revokeLogicalUserOff("shutdown");
                         mEnable = false;
                         mEnableExternal = false;
                         if (mState.oneOf(State.BLE_ON)) {
@@ -615,6 +671,7 @@ public class BluetoothManagerService {
             mSharingRestriction.updateRestriction();
         }
         if (!BluetoothRestriction.isBluetoothAllowed()) {
+            revokeLogicalUserOff("Bluetooth disallowed");
             autoOnSetupTimer();
             if (mState.oneOf(State.OFF)) {
                 return Unit.INSTANCE;
@@ -654,6 +711,7 @@ public class BluetoothManagerService {
         mBleAppManager.clearBleApps();
 
         if (mState.oneOf(State.BLE_ON)) {
+            if (mLogicalUserOff) return Unit.INSTANCE;
             Log.i(TAG, "onBleScanDisabled: Shutting down from BLE_ON");
             mEnable = false;
             bleOnToOff();
@@ -797,6 +855,7 @@ public class BluetoothManagerService {
     }
 
     private Unit bleOnToOffIfNeeded(int reason, String packageName) {
+        if (mLogicalUserOff) return Unit.INSTANCE;
         if (!mState.oneOf(State.BLE_ON)) {
             Log.d(TAG, "bleOnToOffIfNeeded: nothing to do - current state is: " + mState);
             return Unit.INSTANCE;
@@ -1286,6 +1345,7 @@ public class BluetoothManagerService {
                     }
                 }
                 case MESSAGE_BLUETOOTH_SERVICE_DISCONNECTED -> {
+                    revokeLogicalUserOff("service disconnected");
                     Log.e(TAG, "MESSAGE_BLUETOOTH_SERVICE_DISCONNECTED");
                     disableBluetoothComponents();
 
@@ -1319,6 +1379,7 @@ public class BluetoothManagerService {
                 case MESSAGE_RESTART_BLUETOOTH_SERVICE -> handleRestartMessage();
 
                 case MESSAGE_TIMEOUT_BIND -> {
+                    revokeLogicalUserOff("binding timeout");
                     Log.e(TAG, "TIMEOUT_BIND: Impossible to bind to Bluetooth service");
                     mContext.unbindService(mConnection);
                     bluetoothStateChangeHandler(State.BLE_TURNING_ON, State.OFF);
@@ -1365,13 +1426,21 @@ public class BluetoothManagerService {
     }
 
     private void handleRestartMessage() {
+        boolean heldBleOn = mLogicalUserOff && mState.oneOf(State.BLE_ON);
+        revokeLogicalUserOff("service restart");
         // Enable without persisting the setting as it doesn't change when Bluetooth restarts
         mEnable = true;
         mActiveLogs.add(ENABLE_DISABLE_REASON_RESTARTED, true);
-        handleEnable();
+        if (heldBleOn) {
+            // A restart is not a logical resume. OFF callback restarts normally.
+            bleOnToOff();
+        } else {
+            handleEnable();
+        }
     }
 
     private void prepareUserSwitch(UserHandle nextUser) {
+        revokeLogicalUserOff("user switch");
         Log.d(TAG, "prepareUserSwitch(" + nextUser + "): during state:" + mState);
 
         mBleAppManager.clearBleApps(); // Clear registered LE apps to force shut-off
@@ -1458,6 +1527,10 @@ public class BluetoothManagerService {
     }
 
     private boolean resetAdapter() {
+        // No policy survives a Binder lifetime, including failed recovery.
+        mLogicalUserOff = false;
+        mLogicalOffTransition = false;
+        mLogicalResumeClassic = false;
         if (mAdapter == null) {
             return false;
         }
@@ -1536,7 +1609,12 @@ public class BluetoothManagerService {
         }
         Log.d(TAG, "onToBleOn: Sending request");
         try {
-            mAdapter.onToBleOn();
+            if (mLogicalUserOff) {
+                mLogicalOffTransition = true;
+                mAdapter.onToBleOnWithPolicy(true);
+            } else {
+                mAdapter.onToBleOn();
+            }
         } catch (RemoteException e) {
             Log.e(TAG, "Unable to call onToBleOn()", e);
         }
@@ -1632,6 +1710,9 @@ public class BluetoothManagerService {
         }
 
         if (newState == State.OFF) {
+            mLogicalUserOff = false;
+            mLogicalOffTransition = false;
+            mLogicalResumeClassic = false;
             // If Bluetooth is off, send service down event to proxy objects, and unbind
             sendBluetoothServiceDownCallback();
             unbindAndFinish();
@@ -1662,6 +1743,9 @@ public class BluetoothManagerService {
             actionWhenBluetoothReachStateOn();
         } else if (newState == State.BLE_ON && prevState == State.BLE_TURNING_ON) {
             continueFromBleOnState();
+        } else if (newState == State.BLE_ON && prevState == State.TURNING_OFF
+                && mLogicalOffTransition) {
+            finishLogicalOffTransition();
         } else if (newState == State.OFF) {
             actionWhenBluetoothReachStateOff(prevState);
         }
@@ -1749,12 +1833,17 @@ public class BluetoothManagerService {
     }
 
     private void sendDisableMsg(int reason, String packageName) {
+        boolean forceHeldBleOff = mLogicalUserOff && mState.oneOf(State.BLE_ON)
+                && reason != ENABLE_DISABLE_REASON_APPLICATION_REQUEST;
+        setLogicalUserOffForDisable(reason);
         mActiveLogs.add(reason, false, packageName, false);
         mHandler.removeMessages(MESSAGE_RESTART_BLUETOOTH_SERVICE);
 
         mEnable = false;
 
-        if (mState.oneOf(State.ON)) {
+        if (forceHeldBleOff) {
+            bleOnToOff();
+        } else if (mState.oneOf(State.ON)) {
             Log.d(TAG, "Disable - Initiate shutdown");
             onToBleOn();
         } else if (!mBleAppManager.isBleAppPresent() && isBinding()) {
@@ -1787,12 +1876,25 @@ public class BluetoothManagerService {
             return;
         }
 
+        if (mLogicalUserOff && isBle) {
+            // Registering a BLE client is not a request to resume classic.
+            return;
+        }
+
         mHandler.removeMessages(MESSAGE_RESTART_BLUETOOTH_SERVICE);
         mEnable = true;
 
         if (!isBle) {
             setBluetoothPersistedState(BLUETOOTH_ON_BLUETOOTH);
         }
+
+        if (mLogicalUserOff && mState.oneOf(State.TURNING_OFF)) {
+            mLogicalResumeClassic = true;
+            mQuietEnable = quietEnable;
+            return;
+        }
+        mLogicalUserOff = false;
+        mLogicalResumeClassic = false;
 
         if (mState.oneOf(State.BLE_TURNING_ON, State.TURNING_ON, State.ON)) {
             Log.i(TAG, logHeader + "Already enabled. Current state=" + mState);
@@ -1825,6 +1927,8 @@ public class BluetoothManagerService {
     }
 
     private void recoverBluetoothServiceFromError(boolean clearBle) {
+        boolean wasLogicalOff = mLogicalUserOff || mLogicalOffTransition;
+        revokeLogicalUserOff("service error recovery");
         Log.e(TAG, "recoverBluetoothServiceFromError");
         boolean repeatAirplaneRunnable = false;
 
@@ -1847,7 +1951,11 @@ public class BluetoothManagerService {
 
         // disable
         mActiveLogs.add(ENABLE_DISABLE_REASON_START_ERROR, false);
-        onToBleOn();
+        if (wasLogicalOff && mState.oneOf(State.BLE_ON)) {
+            bleOnToOff();
+        } else if (!wasLogicalOff || mState.oneOf(State.ON)) {
+            onToBleOn();
+        } // An in-flight logical stop was already revoked above.
 
         waitForState(State.OFF);
 

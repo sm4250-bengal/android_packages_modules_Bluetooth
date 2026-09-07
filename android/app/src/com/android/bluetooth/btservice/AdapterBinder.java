@@ -108,6 +108,16 @@ class AdapterBinder extends IAdapter.Stub {
     }
 
     @Override
+    public void onToBleOnWithPolicy(boolean keepBleOn) {
+        AdapterService service = getServiceAndEnforcePrivileged();
+        if (service == null
+                || !callerIsSystemOrActiveOrManagedUser(service, TAG, "onToBleOnWithPolicy")) {
+            return;
+        }
+        service.onToBleOnWithPolicy(keepBleOn);
+    }
+
+    @Override
     public void registerCallback(IBluetoothCallback callback) {
         Log.v(TAG, "registerCallback(" + callback + ")");
         AdapterService service = getServiceAndEnforcePrivileged();
