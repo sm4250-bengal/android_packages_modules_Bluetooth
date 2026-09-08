@@ -188,8 +188,8 @@ public class BluetoothManagerService {
 
     private boolean allowsLogicalUserOff() {
         return mKeepStackAliveOnUserOff
-                && Flags.onlyStartScanDuringBleOn()
-                && !Flags.systemServerMigrateBmsToKotlin();
+                && com.android.bluetooth.flags.Flags.onlyStartScanDuringBleOn()
+                && !com.android.bluetooth.flags.Flags.systemServerMigrateBmsToKotlin();
     }
 
     private void revokeLogicalUserOff(String cause) {
