@@ -122,6 +122,10 @@ class AirplaneModeController(
     }
 
     private fun airplaneModeValueOverride(systemMode: Boolean, isBluetoothOn: Boolean?): Boolean {
+        // ACC standby must not inherit media/watch or remembered airplane exceptions.
+        if (Settings.Global.getInt(userContext.contentResolver, "bengal_acc_quiesce", 0) != 0) {
+            return systemMode
+        }
         // Airplane mode is being disabled or bluetooth was not ON: no override
         if (!systemMode || isBluetoothOn == false) {
             return systemMode

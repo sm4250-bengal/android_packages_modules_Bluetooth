@@ -188,6 +188,8 @@ public class BluetoothManagerService {
 
     private boolean allowsLogicalUserOff() {
         return mKeepStackAliveOnUserOff
+                // ACC preparation needs physical controller OFF, not retained BLE.
+                && Settings.Global.getInt(mContext.getContentResolver(), "bengal_acc_quiesce", 0) == 0
                 && com.android.bluetooth.flags.Flags.onlyStartScanDuringBleOn()
                 && !com.android.bluetooth.flags.Flags.systemServerMigrateBmsToKotlin();
     }
